@@ -1,0 +1,400 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from datetime import datetime, timedelta
+import threading
+import time
+import json
+import os
+from plyer import notification
+import winsound
+
+APP_TITLE = "Demon Hunter Multi Tool"
+HISTORY_MAX = 25
+
+# =========================
+# EVENT LOGIC
+# =========================
+
+def get_next_event(now=None):
+    now = now or datetime.now()
+    hour = now.hour
+
+    # Next odd hour
+    if hour % 2 == 0:
+        next_hour = hour + 1
+    else:
+        next_hour = hour + 2
+
+    if next_hour >= 24:
+        next_hour -= 24
+
+    event_time = now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+
+    # Rotation: 1 Regular, 3 Gauntlet, 5 Regular, 7 Gauntlet, ...
+    odd_index = ((next_hour - 1) // 2) % 2
+    event_type = "Gauntlet" if odd_index == 1 else "Regular Event"
+
+    return event_time, event_type
+
+def log_event(msg):
+    ts = datetime.now().strftime("%I:%M:%S %p").lstrip("0")
+    line = f"[{ts}] {msg}"
+    event_history.insert(0, line)
+    if event_history.size() > HISTORY_MAX:
+        event_history.delete(HISTORY_MAX, tk.END)
+
+def play_event_sound(event_type):
+    # Distinct sounds without needing external files
+    if event_type == "Gauntlet":
+        # Red alert-ish (lower -> higher)
+        winsound.Beep(650, 140)
+        winsound.Beep(800, 140)
+        winsound.Beep(1000, 180)
+    else:
+        # Regular (single clean ping)
+        winsound.Beep(950, 180)
+
+def style_for_event(event_type):
+    # UI styling: red for Gauntlet, gold for Regular
+    if event_type == "Gauntlet":
+        return {"fg": "#ff3b3b", "bg": "#140000"}  # red
+    return {"fg": "#ffd24a", "bg": "#141000"}      # gold
+
+def event_loop():
+    notified_for_this_event = False
+    last_event_key = None
+
+    while True:
+        now = datetime.now()
+        event_time, event_type = get_next_event(now)
+        remaining = event_time - now
+
+        # Update UI (countdown + styling)
+        st = style_for_event(event_type)
+        countdown_label.config(
+            text=f"Next: {event_type} @ {event_time.strftime('%I:%M %p').lstrip('0')}  |  In {str(remaining).split('.')[0]}",
+            fg=st["fg"],
+            bg=st["bg"],
+        )
+
+        # Track event key so we only log "new next event" once
+        event_key = (event_time.strftime("%Y-%m-%d %H:%M"), event_type)
+        if last_event_key != event_key:
+            log_event(f"Upcoming: {event_type} at {event_time.strftime('%I:%M %p').lstrip('0')}")
+            last_event_key = event_key
+            notified_for_this_event = False
+
+        # Notify 5 minutes before
+        if (remaining <= timedelta(minutes=5)
+                and remaining.total_seconds() > 0
+                and not notified_for_this_event):
+            notification.notify(
+                title="Demon Hunter Event",
+                message=f"{event_type} starts at {event_time.strftime('%I:%M %p').lstrip('0')}",
+                timeout=10
+            )
+            play_event_sound(event_type)
+            log_event(f"NOTIFY: {event_type} starts in ≤ 5 minutes")
+            notified_for_this_event = True
+
+        # When event starts, log it
+        if remaining.total_seconds() <= 0 and notified_for_this_event:
+            log_event(f"START: {event_type} is starting now")
+            notified_for_this_event = False
+
+        time.sleep(1)
+
+# =========================
+# BUILD / STAT LOGIC
+# =========================
+
+STAT_ORDER = ["Strength", "Constitution", "Intelligence", "Technique"]
+
+def rank_multiplier(rank):
+    return {"Normal": 1.00, "Tsuguko": 1.10, "Pillar": 1.47}.get(rank, 1.00)
+
+def innate_multiplier(innate, stat):
+    return 1.15 if innate == stat else 1.00
+
+def clamp_int(s):
+    try:
+        return max(0, int(s))
+    except:
+        return 0
+
+def total_points_allowed():
+    lvl = clamp_int(level_var.get())
+    if lvl < 1 or lvl > 200:
+        return None
+    return lvl
+
+def update_remaining(*args):
+    lvl = total_points_allowed()
+    if lvl is None:
+        remaining_label.config(text="Level must be 1–200", fg="#ff3b3b")
+        return
+
+    used = sum(clamp_int(stat_vars[s].get()) for s in STAT_ORDER)
+    rem = lvl - used
+
+    if rem < 0:
+        remaining_label.config(text=f"Too many points! ({-rem} over)", fg="#ff3b3b")
+    else:
+        remaining_label.config(text=f"Remaining Points: {rem}", fg="#39ff78")
+
+def calculate_final_stats():
+    lvl = total_points_allowed()
+    if lvl is None:
+        messagebox.showerror("Invalid Level", "Enter a level from 1 to 200.")
+        return
+
+    base = {s: clamp_int(stat_vars[s].get()) for s in STAT_ORDER}
+    used = sum(base.values())
+    if used > lvl:
+        messagebox.showerror("Too Many Points", f"You used {used} points but level {lvl} only allows {lvl}.")
+        return
+
+    innate = innate_var.get()
+    rank = rank_var.get()
+    rmult = rank_multiplier(rank)
+
+    # Dex: user note — Tsuguko/Pillar dex scaling is 0 per stat.
+    # We are not adding Dex as a stat here, but we display the rule clearly:
+    dex_note = "Dex scaling: NORMAL" if rank == "Normal" else "Dex scaling: 0 (rank disables dex-per-stat)"
+
+    final = {}
+    for s in STAT_ORDER:
+        final[s] = round(base[s] * innate_multiplier(innate, s) * rmult, 2)
+
+    lines = [f"Final Stats ({rank}, Innate: {innate})",
+             dex_note,
+             ""]
+    for s in STAT_ORDER:
+        lines.append(f"{s}:  base {base[s]}  →  {final[s]}")
+    final_label.config(text="\n".join(lines), fg="#39ff78")
+
+def apply_points_allocation(allocation):
+    # allocation is dict stat->int
+    for s in STAT_ORDER:
+        stat_vars[s].set(str(int(allocation.get(s, 0))))
+    update_remaining()
+    calculate_final_stats()
+
+def wind_auto_optimize():
+    """
+    Wind build optimizer (heuristic):
+    - Default weights: STR 0.55, INT 0.25, CON 0.15, TECH 0.05
+    - If your innate matches a stat, we bias toward it (+0.10) and renormalize.
+    - Ensures sum == level, all ints, no negatives.
+    """
+    lvl = total_points_allowed()
+    if lvl is None:
+        messagebox.showerror("Invalid Level", "Enter a level from 1 to 200 first.")
+        return
+
+    innate = innate_var.get()
+    weights = {
+        "Strength": 0.55,
+        "Intelligence": 0.25,
+        "Constitution": 0.15,
+        "Technique": 0.05,
+    }
+
+    if innate in weights:
+        weights[innate] += 0.10
+        # take that 0.10 from the biggest other weight (to keep sane)
+        biggest_other = max([k for k in weights if k != innate], key=lambda k: weights[k])
+        weights[biggest_other] = max(0.0, weights[biggest_other] - 0.10)
+
+    # Normalize
+    total_w = sum(weights.values())
+    if total_w <= 0:
+        messagebox.showerror("Optimizer Error", "Weight normalization failed.")
+        return
+    for k in weights:
+        weights[k] /= total_w
+
+    # Allocate ints
+    alloc = {k: int(lvl * weights[k]) for k in weights}
+    # Fix rounding remainder
+    used = sum(alloc.values())
+    remainder = lvl - used
+    # Add remaining points to priority order
+    priority = ["Strength", "Intelligence", "Constitution", "Technique"]
+    i = 0
+    while remainder > 0:
+        alloc[priority[i % len(priority)]] += 1
+        remainder -= 1
+        i += 1
+
+    log_event(f"Build: Auto-optimized Wind (Innate bias: {innate})")
+    apply_points_allocation(alloc)
+
+# =========================
+# SAVE / LOAD
+# =========================
+
+def get_build_payload():
+    lvl = clamp_int(level_var.get())
+    payload = {
+        "level": lvl,
+        "rank": rank_var.get(),
+        "innate": innate_var.get(),
+        "stats": {s: clamp_int(stat_vars[s].get()) for s in STAT_ORDER},
+        "saved_at": datetime.now().isoformat(timespec="seconds")
+    }
+    return payload
+
+def load_build_payload(payload):
+    try:
+        level_var.set(str(int(payload.get("level", 1))))
+        rank_var.set(payload.get("rank", "Normal"))
+        innate_var.set(payload.get("innate", "Strength"))
+        stats = payload.get("stats", {})
+        for s in STAT_ORDER:
+            stat_vars[s].set(str(int(stats.get(s, 0))))
+        update_remaining()
+        calculate_final_stats()
+        log_event("Build: Loaded build file")
+    except Exception as e:
+        messagebox.showerror("Load Error", f"Could not load build:\n{e}")
+
+def save_build():
+    payload = get_build_payload()
+    path = filedialog.asksaveasfilename(
+        defaultextension=".json",
+        filetypes=[("JSON files", "*.json")],
+        initialfile="demon_hunter_build.json",
+        title="Save Build"
+    )
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        log_event(f"Build: Saved to {os.path.basename(path)}")
+        messagebox.showinfo("Saved", f"Build saved to:\n{path}")
+    except Exception as e:
+        messagebox.showerror("Save Error", str(e))
+
+def load_build():
+    path = filedialog.askopenfilename(
+        filetypes=[("JSON files", "*.json")],
+        title="Load Build"
+    )
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        load_build_payload(payload)
+        messagebox.showinfo("Loaded", f"Build loaded from:\n{path}")
+    except Exception as e:
+        messagebox.showerror("Load Error", str(e))
+
+# =========================
+# GUI
+# =========================
+
+root = tk.Tk()
+root.title(APP_TITLE)
+root.geometry("860x640")
+root.configure(bg="#0b0b0b")
+
+# Layout: left main panel + right history panel
+main = tk.Frame(root, bg="#0b0b0b")
+main.pack(side="left", fill="both", expand=True, padx=12, pady=12)
+
+side = tk.Frame(root, bg="#0b0b0b")
+side.pack(side="right", fill="y", padx=12, pady=12)
+
+tk.Label(
+    main,
+    text=APP_TITLE,
+    fg="gold",
+    bg="#0b0b0b",
+    font=("Segoe UI", 18, "bold")
+).pack(pady=(0, 10), anchor="w")
+
+# ---- Event section ----
+tk.Label(main, text="Event Timer", fg="white", bg="#0b0b0b", font=("Segoe UI", 14)).pack(anchor="w")
+countdown_label = tk.Label(
+    main,
+    text="Loading...",
+    fg="#ffd24a",
+    bg="#141000",
+    font=("Consolas", 12),
+    padx=10,
+    pady=8
+)
+countdown_label.pack(fill="x", pady=(6, 14))
+
+# ---- Build section ----
+tk.Label(main, text="Build Planner", fg="white", bg="#0b0b0b", font=("Segoe UI", 14)).pack(anchor="w")
+
+form = tk.Frame(main, bg="#0b0b0b")
+form.pack(fill="x", pady=(8, 6))
+
+level_var = tk.StringVar()
+level_var.trace_add("write", update_remaining)
+
+tk.Label(form, text="Level (1–200)", fg="white", bg="#0b0b0b").grid(row=0, column=0, sticky="w")
+tk.Entry(form, textvariable=level_var, width=10).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+# Innate / Rank
+innate_var = tk.StringVar(value="Strength")
+rank_var = tk.StringVar(value="Normal")
+
+tk.Label(form, text="Innate (1.15×)", fg="white", bg="#0b0b0b").grid(row=0, column=2, sticky="w", padx=(18, 0))
+tk.OptionMenu(form, innate_var, "Strength", "Constitution", "Intelligence", "Technique").grid(row=0, column=3, sticky="w", padx=(10, 0))
+
+tk.Label(form, text="Rank (multiplier)", fg="white", bg="#0b0b0b").grid(row=0, column=4, sticky="w", padx=(18, 0))
+tk.OptionMenu(form, rank_var, "Normal", "Tsuguko", "Pillar").grid(row=0, column=5, sticky="w", padx=(10, 0))
+
+# Stats inputs
+stats_frame = tk.Frame(main, bg="#0b0b0b")
+stats_frame.pack(fill="x", pady=(6, 8))
+
+stat_vars = {}
+for i, s in enumerate(STAT_ORDER):
+    tk.Label(stats_frame, text=s, fg="white", bg="#0b0b0b").grid(row=i, column=0, sticky="w", pady=2)
+    v = tk.StringVar()
+    v.trace_add("write", update_remaining)
+    stat_vars[s] = v
+    tk.Entry(stats_frame, textvariable=v, width=12).grid(row=i, column=1, sticky="w", padx=(10, 0), pady=2)
+
+remaining_label = tk.Label(main, text="", bg="#0b0b0b", fg="#39ff78", font=("Segoe UI", 11, "bold"))
+remaining_label.pack(anchor="w", pady=(2, 10))
+
+# Actions
+btns = tk.Frame(main, bg="#0b0b0b")
+btns.pack(fill="x", pady=(0, 10))
+
+tk.Button(btns, text="Calculate Final Stats", bg="gold", command=calculate_final_stats).pack(side="left")
+tk.Button(btns, text="Auto-Optimize Wind Build", bg="#9be7ff", command=wind_auto_optimize).pack(side="left", padx=10)
+tk.Button(btns, text="Save Build", bg="#c9ff9b", command=save_build).pack(side="left")
+tk.Button(btns, text="Load Build", bg="#c9ff9b", command=load_build).pack(side="left", padx=10)
+
+final_label = tk.Label(main, text="", bg="#0b0b0b", fg="#39ff78", justify="left", font=("Consolas", 11))
+final_label.pack(fill="x", pady=(6, 0))
+
+# ---- Right panel: History ----
+tk.Label(side, text="Event History", fg="white", bg="#0b0b0b", font=("Segoe UI", 14)).pack(anchor="w")
+event_history = tk.Listbox(
+    side,
+    width=44,
+    height=30,
+    bg="#111111",
+    fg="#dddddd",
+    selectbackground="#333333",
+    highlightthickness=0
+)
+event_history.pack(fill="y", pady=(8, 0))
+
+# Seed history
+log_event("Tool started")
+
+# Start background thread
+threading.Thread(target=event_loop, daemon=True).start()
+
+root.mainloop()
